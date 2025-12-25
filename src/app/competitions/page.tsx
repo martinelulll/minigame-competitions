@@ -73,7 +73,7 @@ export default function CompetitionsPage() {
 
                     <button
                       className="px-4 py-2 rounded-lg bg-white text-black font-semibold"
-                      onClick={() => alert(`Start competiție: ${c.title}`)}
+                      onClick={() => router.push("/minigame")}
                     >
                       Intră
                     </button>
