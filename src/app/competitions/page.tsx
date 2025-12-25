@@ -73,7 +73,7 @@ export default function CompetitionsPage() {
 
                     <button
                       className="px-4 py-2 rounded-lg bg-white text-black font-semibold"
-                      onClick={() => router.push("/minigame")}
+                    onClick={() => router.push("/competitions/daily")}
                     >
                       Intră
                     </button>
