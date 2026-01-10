@@ -1,358 +1,514 @@
-"use client";
+// app/competitions/[slug]/page.tsx
+'use client';
 
-import { useEffect, useMemo, useRef, useState } from "react";
-import { useRouter, useParams } from "next/navigation";
-import { supabase } from "@/lib/supabaseClient";
+import { useState, useEffect, useCallback } from 'react';
+import { useRouter } from 'next/navigation';
+import { createClientComponentClient } from '@supabase/auth-helpers-nextjs';
+import Link from 'next/link';
 
-type LeaderRow = { user_id: string; email: string | null; best_score: number };
-
-export default function CompetitionSlugPage() {
-  const router = useRouter();
-  const params = useParams<{ slug: string }>();
-  const slug = params?.slug;
-
-  useEffect(() => {
-    // protecție: dacă nu e logat -> login
-    supabase.auth.getUser().then(({ data }) => {
-      if (!data.user) router.push("/login");
-    });
-  }, [router]);
-
-  if (!slug) return null;
-
-  if (slug === "daily") {
-    return <DailyReflexGame onBack={() => router.push("/competitions")} />;
-  }
-
-  return (
-    <main className="min-h-screen bg-black text-white flex items-center justify-center p-6">
-      <div className="w-full max-w-xl border border-white/10 rounded-2xl p-6 bg-white/5">
-        <h1 className="text-2xl font-bold">Competiție: {slug}</h1>
-        <p className="text-white/70 mt-2">În curând 🔥</p>
-        <button
-          onClick={() => router.push("/competitions")}
-          className="mt-6 px-4 py-2 rounded bg-white text-black"
-        >
-          Înapoi la competiții
-        </button>
-      </div>
-    </main>
-  );
+interface GameTarget {
+  id: number;
+  x: number;
+  y: number;
+  size: number;
+  color: string;
 }
 
-function DailyReflexGame({ onBack }: { onBack: () => void }) {
-  const router = useRouter();
+interface LeaderboardEntry {
+  rank: number;
+  email: string;
+  best_score: number;
+}
 
-  const DURATION_MS = 30_000;
-  const MOVE_EVERY_MS = 650;
+const GAME_DURATION = 30; // 30 de secunde
+const TARGET_SIZE_MIN = 60;
+const TARGET_SIZE_MAX = 100;
+const COLORS = [
+  'bg-red-500', 'bg-blue-500', 'bg-green-500', 
+  'bg-yellow-500', 'bg-purple-500', 'bg-pink-500'
+];
 
-  const [email, setEmail] = useState<string | null>(null);
-
-  const [running, setRunning] = useState(false);
-  const [timeLeft, setTimeLeft] = useState(DURATION_MS);
+export default function DailyCompetitionPage() {
+  const [gameState, setGameState] = useState<'idle' | 'playing' | 'finished'>('idle');
+  const [timeLeft, setTimeLeft] = useState(GAME_DURATION);
   const [score, setScore] = useState(0);
+  const [targets, setTargets] = useState<GameTarget[]>([]);
   const [streak, setStreak] = useState(0);
-  const [hits, setHits] = useState(0);
   const [misses, setMisses] = useState(0);
+  const [hits, setHits] = useState(0);
+  const [accuracy, setAccuracy] = useState(0);
+  const [totalClicks, setTotalClicks] = useState(0);
+  const [lastScore, setLastScore] = useState(0);
+  const [playerRank, setPlayerRank] = useState<number | null>(null);
+  const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>([]);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  
+  const router = useRouter();
+  const supabase = createClientComponentClient();
 
-  const [submittedBest, setSubmittedBest] = useState<number | null>(null);
-  const [leaderboard, setLeaderboard] = useState<LeaderRow[]>([]);
-  const [loadingLb, setLoadingLb] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
-
-  const arenaRef = useRef<HTMLDivElement | null>(null);
-  const [target, setTarget] = useState({ x: 40, y: 40, r: 22 });
-
-  const accuracy = useMemo(() => {
-    const total = hits + misses;
-    if (total === 0) return 1;
-    return hits / total;
-  }, [hits, misses]);
-
+  // Efect pentru timer
   useEffect(() => {
-    supabase.auth.getUser().then(({ data }) => {
-      setEmail(data.user?.email ?? null);
-      if (!data.user) router.push("/login");
-    });
-  }, [router]);
+    let timer: NodeJS.Timeout;
+    
+    if (gameState === 'playing' && timeLeft > 0) {
+      timer = setTimeout(() => {
+        setTimeLeft(time => time - 1);
+      }, 1000);
+    } else if (timeLeft === 0 && gameState === 'playing') {
+      endGame();
+    }
+    
+    return () => clearTimeout(timer);
+  }, [gameState, timeLeft]);
 
-  // mișcă ținta random în arena
-  const moveTarget = () => {
-    const el = arenaRef.current;
-    if (!el) return;
-    const rect = el.getBoundingClientRect();
-    const r = 22;
-
-    const maxX = Math.max(r, rect.width - r);
-    const maxY = Math.max(r, rect.height - r);
-
-    const x = Math.floor(r + Math.random() * (maxX - r));
-    const y = Math.floor(r + Math.random() * (maxY - r));
-
-    setTarget({ x, y, r });
-  };
-
+  // Efect pentru accuracy
   useEffect(() => {
-    if (!running) return;
+    if (totalClicks > 0) {
+      setAccuracy(Math.round((hits / totalClicks) * 100));
+    }
+  }, [hits, totalClicks]);
 
-    setErr(null);
-    moveTarget();
-
-    const t0 = Date.now();
-    const tick = setInterval(() => {
-      const elapsed = Date.now() - t0;
-      const left = Math.max(0, DURATION_MS - elapsed);
-      setTimeLeft(left);
-      if (left === 0) setRunning(false);
-    }, 100);
-
-    const mover = setInterval(() => {
-      moveTarget();
-    }, MOVE_EVERY_MS);
-
-    return () => {
-      clearInterval(tick);
-      clearInterval(mover);
+  const spawnTarget = useCallback(() => {
+    if (gameState !== 'playing') return;
+    
+    const newTarget: GameTarget = {
+      id: Date.now(),
+      x: Math.random() * 85, // 85% pentru a evita marginile
+      y: Math.random() * 85,
+      size: Math.random() * (TARGET_SIZE_MAX - TARGET_SIZE_MIN) + TARGET_SIZE_MIN,
+      color: COLORS[Math.floor(Math.random() * COLORS.length)]
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [running]);
+    
+    setTargets(prev => [...prev, newTarget]);
+    
+    // Auto-remove target after 1.5 seconds (creates challenge)
+    setTimeout(() => {
+      setTargets(prev => prev.filter(t => t.id !== newTarget.id));
+      setStreak(0);
+    }, 1500);
+  }, [gameState]);
 
-  const resetRun = () => {
-    setRunning(false);
-    setTimeLeft(DURATION_MS);
+  // Spawn targets periodically
+  useEffect(() => {
+    let spawnInterval: NodeJS.Timeout;
+    
+    if (gameState === 'playing') {
+      spawnTarget(); // Primul target
+      spawnInterval = setInterval(() => {
+        if (Math.random() > 0.3) { // 70% chance to spawn
+          spawnTarget();
+        }
+      }, 800); // Spawn la fiecare 0.8 secunde
+    }
+    
+    return () => clearInterval(spawnInterval);
+  }, [gameState, spawnTarget]);
+
+  const startGame = () => {
+    setGameState('playing');
+    setTimeLeft(GAME_DURATION);
     setScore(0);
+    setTargets([]);
     setStreak(0);
-    setHits(0);
     setMisses(0);
-    setSubmittedBest(null);
-    setErr(null);
+    setHits(0);
+    setTotalClicks(0);
+    setAccuracy(0);
   };
 
-  const start = () => {
-    resetRun();
-    setRunning(true);
+  const handleTargetClick = (targetId: number) => {
+    if (gameState !== 'playing') return;
+    
+    setTotalClicks(prev => prev + 1);
+    setHits(prev => prev + 1);
+    
+    // Calculare punctaj pe baza size-ului și streak-ului
+    const target = targets.find(t => t.id === targetId);
+    if (!target) return;
+    
+    const sizeBonus = Math.round((TARGET_SIZE_MAX - target.size) / 10);
+    const streakBonus = Math.min(streak * 2, 10);
+    const points = 10 + sizeBonus + streakBonus;
+    
+    setScore(prev => prev + points);
+    setStreak(prev => prev + 1);
+    
+    // Remove the clicked target
+    setTargets(prev => prev.filter(t => t.id !== targetId));
+    
+    // Spawn new target imediat
+    setTimeout(() => spawnTarget(), 100);
   };
 
-  const onHit = () => {
-    if (!running) return;
-    const nextStreak = streak + 1;
-    setStreak(nextStreak);
-    setHits((v) => v + 1);
-
-    // punctaj: bază + bonus streak
-    const add = 10 + Math.min(20, nextStreak * 2);
-    setScore((s) => s + add);
-
-    moveTarget();
-  };
-
-  const onMiss = () => {
-    if (!running) return;
-    setMisses((v) => v + 1);
+  const handleMissClick = () => {
+    if (gameState !== 'playing') return;
+    
+    setTotalClicks(prev => prev + 1);
+    setMisses(prev => prev + 1);
     setStreak(0);
-    setScore((s) => Math.max(0, s - 5));
+    setScore(prev => Math.max(0, prev - 2)); // Penalizare 2 puncte
   };
 
-  const finalScore = useMemo(() => {
-    // bonus accuracy (max +25%)
-    const bonus = 1 + Math.min(0.25, (accuracy - 0.5) * 0.5); // dacă ai peste 50% accuracy, crește ușor
-    return Math.floor(score * bonus);
-  }, [score, accuracy]);
-
-  const loadLeaderboard = async () => {
-    setLoadingLb(true);
-    const { data, error } = await supabase
-      .from("daily_leaderboard")
-      .select("user_id,email,best_score")
-      .order("best_score", { ascending: false })
-      .limit(20);
-
-    setLoadingLb(false);
-    if (error) {
-      setErr(error.message);
-      return;
-    }
-    setLeaderboard((data as any) ?? []);
-  };
-
-  const submitScore = async () => {
-    setErr(null);
-    const { data: userData } = await supabase.auth.getUser();
-    if (!userData.user) {
-      router.push("/login");
-      return;
-    }
-
-    // trimite scorul prin funcție (DB decide best + update profiles.points)
-    const { data, error } = await supabase.rpc("submit_daily_score", {
-      p_score: finalScore,
-    });
-
-    if (error) {
-      setErr(error.message);
-      return;
-    }
-
-    setSubmittedBest(typeof data === "number" ? data : finalScore);
+  const endGame = async () => {
+    setGameState('finished');
+    
+    // Calculare scor final cu bonusuri
+    const accuracyBonus = Math.round(accuracy * 0.5);
+    const streakBonus = Math.round(streak * 1.5);
+    const finalScore = score + accuracyBonus + streakBonus;
+    
+    setLastScore(finalScore);
+    
+    // Submit scor la Supabase
+    await submitScore(finalScore);
+    
+    // Încărcare leaderboard
     await loadLeaderboard();
   };
 
+  const submitScore = async (finalScore: number) => {
+    setIsSubmitting(true);
+    try {
+      const { data, error } = await supabase
+        .rpc('submit_daily_score', { score: finalScore });
+      
+      if (error) throw error;
+      
+      console.log('Score submitted successfully:', data);
+    } catch (error) {
+      console.error('Error submitting score:', error);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const loadLeaderboard = async () => {
+    try {
+      // Folosim view-ul daily_leaderboard
+      const { data: leaderboardData, error } = await supabase
+        .from('daily_leaderboard')
+        .select('*')
+        .limit(10)
+        .order('best_score', { ascending: false });
+      
+      if (error) throw error;
+      
+      // Adăugăm rank-uri
+      const rankedData = leaderboardData.map((item, index) => ({
+        ...item,
+        rank: index + 1
+      }));
+      
+      setLeaderboard(rankedData);
+      
+      // Obținem poziția curentă a user-ului
+      const { data: userData } = await supabase.auth.getUser();
+      if (userData.user) {
+        const userEntry = rankedData.find(entry => 
+          entry.email === userData.user.email
+        );
+        if (userEntry) {
+          setPlayerRank(userEntry.rank);
+        }
+      }
+    } catch (error) {
+      console.error('Error loading leaderboard:', error);
+    }
+  };
+
+  // Încărcare leaderboard la mount
   useEffect(() => {
-    loadLeaderboard();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    if (gameState === 'idle') {
+      loadLeaderboard();
+    }
   }, []);
 
+  const formatTime = (seconds: number) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins}:${secs.toString().padStart(2, '0')}`;
+  };
+
   return (
-    <main className="min-h-screen bg-black text-white p-6">
-      <div className="max-w-5xl mx-auto">
-        <div className="flex items-center justify-between gap-4">
-          <div>
-            <h1 className="text-3xl font-bold">🏆 MiniGame Zilnic</h1>
-            <p className="text-white/70 mt-1">
-              Reflex Click Arena — 30 secunde • Logat ca:{" "}
-              <span className="text-white">{email ?? "..."}</span>
-            </p>
-          </div>
+    <div className="min-h-screen bg-gradient-to-br from-gray-900 to-black text-white p-4 md:p-8">
+      <div className="max-w-6xl mx-auto">
+        {/* Header */}
+        <header className="mb-8">
+          <Link 
+            href="/dashboard" 
+            className="text-gray-400 hover:text-white mb-4 inline-block"
+          >
+            ← Înapoi la Dashboard
+          </Link>
+          <h1 className="text-4xl md:text-5xl font-bold mb-2">
+            🎯 Reflex Click Arena
+          </h1>
+          <p className="text-gray-400 text-lg">
+            Click pe cercuri cât mai repede și precis pentru puncte maxime!
+          </p>
+        </header>
 
-          <div className="flex gap-2">
-            <button onClick={onBack} className="px-4 py-2 rounded border border-white/30">
-              Înapoi
-            </button>
-            <button
-              onClick={async () => {
-                await supabase.auth.signOut();
-                router.push("/login");
-              }}
-              className="px-4 py-2 rounded border border-red-500/60 text-red-300"
-            >
-              Logout
-            </button>
-          </div>
-        </div>
-
-        <div className="mt-6 grid grid-cols-1 lg:grid-cols-3 gap-4">
-          <div className="lg:col-span-2 border border-white/10 rounded-2xl bg-white/5 p-4">
-            <div className="flex items-center justify-between flex-wrap gap-3">
-              <div className="flex gap-4">
-                <Stat label="Timp" value={`${Math.ceil(timeLeft / 1000)}s`} />
-                <Stat label="Scor" value={`${score}`} />
-                <Stat label="Streak" value={`${streak}`} />
-                <Stat label="Accuracy" value={`${Math.round(accuracy * 100)}%`} />
-              </div>
-
-              <div className="flex gap-2">
-                {!running ? (
-                  <button onClick={start} className="px-4 py-2 rounded bg-white text-black">
-                    Start
-                  </button>
-                ) : (
-                  <button onClick={() => setRunning(false)} className="px-4 py-2 rounded border border-white/30">
-                    Stop
-                  </button>
-                )}
-                <button onClick={resetRun} className="px-4 py-2 rounded border border-white/30">
-                  Reset
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+          {/* Coloana 1: Panou de control și statistici */}
+          <div className="space-y-6">
+            {/* Panou de control joc */}
+            <div className="bg-gray-800/50 backdrop-blur-sm rounded-2xl p-6 border border-gray-700">
+              <h2 className="text-2xl font-bold mb-4">Control Joc</h2>
+              
+              {gameState === 'idle' && (
+                <button
+                  onClick={startGame}
+                  className="w-full bg-gradient-to-r from-green-500 to-emerald-600 text-white py-4 rounded-xl text-xl font-bold hover:from-green-600 hover:to-emerald-700 transition-all duration-300 shadow-lg shadow-green-500/20"
+                >
+                  🚀 START JOC
                 </button>
+              )}
+              
+              {gameState === 'playing' && (
+                <button
+                  onClick={() => setGameState('finished')}
+                  className="w-full bg-gradient-to-r from-red-500 to-red-600 text-white py-4 rounded-xl text-xl font-bold hover:from-red-600 hover:to-red-700 transition-all duration-300"
+                >
+                  ⏹️ STOP JOC
+                </button>
+              )}
+              
+              {gameState === 'finished' && (
+                <button
+                  onClick={startGame}
+                  className="w-full bg-gradient-to-r from-blue-500 to-blue-600 text-white py-4 rounded-xl text-xl font-bold hover:from-blue-600 hover:to-blue-700 transition-all duration-300"
+                >
+                  🔄 JOACĂ DIN NOU
+                </button>
+              )}
+              
+              <div className="mt-6 space-y-4">
+                <div className="flex justify-between items-center">
+                  <span className="text-gray-400">Timp rămas:</span>
+                  <span className={`text-2xl font-bold ${
+                    timeLeft < 10 ? 'text-red-400 animate-pulse' : 'text-white'
+                  }`}>
+                    {formatTime(timeLeft)}
+                  </span>
+                </div>
+                
+                <div className="flex justify-between items-center">
+                  <span className="text-gray-400">Scor:</span>
+                  <span className="text-3xl font-bold text-yellow-400">
+                    {score}
+                  </span>
+                </div>
+                
+                <div className="flex justify-between items-center">
+                  <span className="text-gray-400">Streak:</span>
+                  <span className={`text-xl font-bold ${
+                    streak > 5 ? 'text-green-400' : 'text-white'
+                  }`}>
+                    {streak} 🔥
+                  </span>
+                </div>
               </div>
             </div>
 
-            <div
-              ref={arenaRef}
-              onClick={onMiss}
-              className="mt-4 relative w-full h-[420px] rounded-xl border border-white/10 bg-black overflow-hidden select-none"
+            {/* Statistici */}
+            <div className="bg-gray-800/50 backdrop-blur-sm rounded-2xl p-6 border border-gray-700">
+              <h2 className="text-2xl font-bold mb-4">📊 Statistici</h2>
+              
+              <div className="grid grid-cols-2 gap-4">
+                <div className="text-center p-4 bg-gray-900/50 rounded-xl">
+                  <div className="text-3xl font-bold text-green-400">{hits}</div>
+                  <div className="text-gray-400 text-sm">Hit-uri</div>
+                </div>
+                
+                <div className="text-center p-4 bg-gray-900/50 rounded-xl">
+                  <div className="text-3xl font-bold text-red-400">{misses}</div>
+                  <div className="text-gray-400 text-sm">Miss-uri</div>
+                </div>
+                
+                <div className="text-center p-4 bg-gray-900/50 rounded-xl">
+                  <div className="text-3xl font-bold text-blue-400">{accuracy}%</div>
+                  <div className="text-gray-400 text-sm">Precizie</div>
+                </div>
+                
+                <div className="text-center p-4 bg-gray-900/50 rounded-xl">
+                  <div className="text-3xl font-bold text-purple-400">
+                    {totalClicks}
+                  </div>
+                  <div className="text-gray-400 text-sm">Total Click-uri</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Coloana 2: Arena de joc */}
+          <div className="lg:col-span-2">
+            <div 
+              className="relative bg-gray-900/30 backdrop-blur-sm rounded-2xl border-2 border-gray-700 overflow-hidden"
+              style={{ height: '600px' }}
+              onClick={handleMissClick}
             >
-              {/* target */}
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onHit();
-                }}
-                aria-label="target"
-                className="absolute rounded-full border border-white/80 bg-white/20 hover:bg-white/30 active:scale-95 transition"
-                style={{
-                  width: target.r * 2,
-                  height: target.r * 2,
-                  left: target.x - target.r,
-                  top: target.y - target.r,
-                }}
-              />
-              {!running && timeLeft === 0 && (
-                <div className="absolute inset-0 flex items-center justify-center bg-black/60">
-                  <div className="text-center">
-                    <div className="text-2xl font-bold">Runda terminată!</div>
-                    <div className="text-white/70 mt-2">
-                      Scor final: <span className="text-white">{finalScore}</span>
+              {/* Arena de joc */}
+              <div className="absolute inset-0">
+                {gameState === 'playing' && (
+                  <>
+                    {/* Grid pattern subtle */}
+                    <div className="absolute inset-0 opacity-10">
+                      {Array.from({ length: 20 }).map((_, i) => (
+                        <div key={i} className="absolute h-full w-px bg-white" style={{ left: `${i * 5}%` }}></div>
+                      ))}
+                      {Array.from({ length: 20 }).map((_, i) => (
+                        <div key={i} className="absolute w-full h-px bg-white" style={{ top: `${i * 5}%` }}></div>
+                      ))}
                     </div>
-                    <button
-                      onClick={submitScore}
-                      className="mt-4 px-4 py-2 rounded bg-white text-black"
-                    >
-                      Trimite scorul
-                    </button>
-                    {submittedBest !== null && (
-                      <div className="mt-3 text-white/80">
-                        Best-ul tău (daily): <span className="text-white">{submittedBest}</span>
+                    
+                    {/* Instrucțiuni */}
+                    <div className="absolute top-4 left-1/2 transform -translate-x-1/2 text-center">
+                      <div className="text-lg font-semibold bg-black/50 px-4 py-2 rounded-full">
+                        ⚡ Click pe cercuri pentru puncte! ⚡
                       </div>
-                    )}
+                    </div>
+                  </>
+                )}
+                
+                {gameState === 'finished' && (
+                  <div className="absolute inset-0 flex items-center justify-center">
+                    <div className="text-center bg-black/70 p-8 rounded-2xl backdrop-blur-sm">
+                      <div className="text-6xl mb-4">🎉</div>
+                      <div className="text-3xl font-bold mb-2">Joc Terminat!</div>
+                      <div className="text-5xl font-bold text-yellow-400 mb-4">
+                        {lastScore} puncte
+                      </div>
+                      <div className="text-gray-300">
+                        Poziția ta: {playerRank ? `#${playerRank}` : 'Se încarcă...'}
+                      </div>
+                      {isSubmitting && (
+                        <div className="mt-4 text-blue-400">
+                          Se încarcă scorul...
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+                
+                {/* Targets */}
+                {targets.map(target => (
+                  <button
+                    key={target.id}
+                    className={`absolute rounded-full transition-transform duration-200 hover:scale-110 active:scale-95 ${target.color}`}
+                    style={{
+                      left: `${target.x}%`,
+                      top: `${target.y}%`,
+                      width: `${target.size}px`,
+                      height: `${target.size}px`,
+                      transform: 'translate(-50%, -50%)'
+                    }}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleTargetClick(target.id);
+                    }}
+                  >
+                    <div className="absolute inset-0 flex items-center justify-center">
+                      <span className="text-white font-bold text-lg drop-shadow-lg">
+                        +{Math.round((TARGET_SIZE_MAX - target.size) / 10 + 10)}
+                      </span>
+                    </div>
+                  </button>
+                ))}
+              </div>
+
+              {/* Game state overlay */}
+              {gameState === 'idle' && (
+                <div className="absolute inset-0 flex items-center justify-center bg-black/60 backdrop-blur-sm rounded-2xl">
+                  <div className="text-center p-8">
+                    <div className="text-6xl mb-4">🎯</div>
+                    <div className="text-3xl font-bold mb-4">Gata de acțiune?</div>
+                    <div className="text-gray-300 max-w-md mx-auto">
+                      Ai 30 de secunde să atingi cât mai multe cercuri.
+                      <br />
+                      <span className="text-yellow-400">Cercuri mai mici = mai multe puncte!</span>
+                    </div>
+                    <div className="mt-6 bg-gray-800/50 p-4 rounded-xl">
+                      <div className="font-semibold mb-2">📋 Reguli:</div>
+                      <ul className="text-left text-sm text-gray-300 space-y-1">
+                        <li>• Click pe cerc = +10 puncte + bonus dimensiune</li>
+                        <li>• Streak-uri cresc bonusurile (+2 puncte per streak)</li>
+                        <li>• Miss click = -2 puncte și reset streak</li>
+                        <li>• Cercuri dispar după 1.5 secunde</li>
+                      </ul>
+                    </div>
                   </div>
                 </div>
               )}
             </div>
 
-            <p className="text-white/60 mt-3 text-sm">
-              Tip: încearcă să nu dai click pe fundal (ratezi și pierzi streak). Ținta se mută periodic.
-            </p>
-
-            {err && (
-              <div className="mt-3 p-3 rounded border border-red-500/40 text-red-200 bg-red-500/10">
-                {err}
+            {/* Leaderboard - vizibil mereu */}
+            {leaderboard.length > 0 && (
+              <div className="mt-6 bg-gray-800/50 backdrop-blur-sm rounded-2xl p-6 border border-gray-700">
+                <div className="flex justify-between items-center mb-4">
+                  <h2 className="text-2xl font-bold">🏆 Top Jucători</h2>
+                  <button
+                    onClick={loadLeaderboard}
+                    className="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg transition-colors"
+                  >
+                    🔄 Refresh
+                  </button>
+                </div>
+                
+                <div className="space-y-2">
+                  {leaderboard.map((entry) => (
+                    <div
+                      key={entry.email}
+                      className={`flex items-center justify-between p-3 rounded-lg ${
+                        entry.email === playerRank ? 'bg-gradient-to-r from-yellow-900/30 to-yellow-800/20 border border-yellow-700/50' :
+                        entry.rank <= 3 ? 'bg-gradient-to-r from-gray-900 to-gray-800' :
+                        'bg-gray-900/50'
+                      }`}
+                    >
+                      <div className="flex items-center space-x-4">
+                        <div className={`w-8 h-8 rounded-full flex items-center justify-center font-bold ${
+                          entry.rank === 1 ? 'bg-yellow-500 text-black' :
+                          entry.rank === 2 ? 'bg-gray-400 text-black' :
+                          entry.rank === 3 ? 'bg-amber-700 text-white' :
+                          'bg-gray-800 text-gray-300'
+                        }`}>
+                          {entry.rank}
+                        </div>
+                        <div className="font-medium">
+                          {entry.email}
+                          {entry.email === playerRank && (
+                            <span className="ml-2 text-xs bg-yellow-500 text-black px-2 py-1 rounded-full">
+                              TU
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                      <div className="text-xl font-bold text-yellow-400">
+                        {entry.best_score}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                
+                {playerRank && playerRank > 10 && (
+                  <div className="mt-4 pt-4 border-t border-gray-700 text-center text-gray-400">
+                    Poziția ta în top: <span className="font-bold text-white">#{playerRank}</span>
+                  </div>
+                )}
               </div>
             )}
           </div>
+        </div>
 
-          <div className="border border-white/10 rounded-2xl bg-white/5 p-4">
-            <div className="flex items-center justify-between">
-              <h2 className="text-xl font-bold">🏅 Leaderboard</h2>
-              <button
-                onClick={loadLeaderboard}
-                className="px-3 py-1 rounded border border-white/30 text-sm"
-              >
-                Refresh
-              </button>
-            </div>
-
-            {loadingLb ? (
-              <p className="text-white/60 mt-3">Se încarcă…</p>
-            ) : (
-              <ol className="mt-3 space-y-2">
-                {leaderboard.map((row, idx) => (
-                  <li
-                    key={row.user_id}
-                    className="flex items-center justify-between gap-3 rounded-lg border border-white/10 bg-black/30 px-3 py-2"
-                  >
-                    <div className="flex items-center gap-3 min-w-0">
-                      <span className="w-6 text-white/60">{idx + 1}</span>
-                      <span className="truncate text-white/80">
-                        {row.email ?? row.user_id}
-                      </span>
-                    </div>
-                    <span className="font-bold">{row.best_score}</span>
-                  </li>
-                ))}
-              </ol>
-            )}
-          </div>
+        {/* Footer cu informații */}
+        <div className="mt-8 text-center text-gray-500 text-sm">
+          <p>
+            🎮 Jocul se salvează automat. Poți juca o dată pe zi pentru clasamentul zilnic.
+          </p>
+          <p className="mt-1">
+            Scorul se calculează: puncte bază + bonus precizie + bonus streak
+          </p>
         </div>
       </div>
-    </main>
-  );
-}
-
-function Stat({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="px-3 py-2 rounded-lg border border-white/10 bg-black/30">
-      <div className="text-xs text-white/60">{label}</div>
-      <div className="text-lg font-bold">{value}</div>
     </div>
   );
 }
